@@ -5,14 +5,25 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1";
 import {
+  backupStamp,
   checkOccReachable,
+  computeCompatibility,
   computeDrift,
   diagnoseStatusBody,
+  dockerExecArgv,
+  dumpScript,
+  type ExecSpec,
   imageTag,
+  inspectDump,
+  listTarGz,
   model,
   occArgv,
   type OccResult,
   parseAppList,
+  parseDu,
+  parseStoreApps,
+  sha256Hex,
+  tableCountScript,
   parseAppUpdates,
   parseMaintenanceMode,
   parseRepairDryRun,
@@ -389,6 +400,7 @@ function harness(script: Script) {
       imageVariant: "apache",
       verifyRegistry: "registry-1.docker.io",
       verifyRepository: "library/nextcloud",
+      appStoreUrl: "https://apps.nextcloud.com",
       timeoutMs: 1000,
       occTimeoutMs: 1000,
     },
@@ -787,4 +799,461 @@ Deno.test("occ-reachable fails when Nextcloud is not installed", async () => {
       }),
   );
   assertEquals(result.pass, false);
+});
+
+/* ------------------------------------------------------------------ *
+ * apps: compatibility with a target version
+ * ------------------------------------------------------------------ */
+
+// The shape of apps.nextcloud.com/api/v1/platform/<v>/apps.json, trimmed.
+const STORE = [
+  {
+    id: "calendar",
+    releases: [
+      { version: "6.6.2", isNightly: false },
+      { version: "6.6.1", isNightly: false },
+    ],
+  },
+  { id: "deck", releases: [{ version: "2.0.0-nightly", isNightly: true }] },
+  { id: "notes", releases: [{ version: "5.0.0", isNightly: false }] },
+];
+
+Deno.test("parseStoreApps keeps stable releases and drops nightlies", () => {
+  const m = parseStoreApps(STORE);
+  assertEquals(m.get("calendar"), ["6.6.2", "6.6.1"]);
+  assertEquals(m.has("deck"), false);
+  assertThrows(() => parseStoreApps({ error: "nope" }), Error, "not a list");
+});
+
+Deno.test("computeCompatibility separates 'has a release' from 'installed release is listed'", () => {
+  const c = computeCompatibility(
+    { notes: "4.9.0", calendar: "6.6.1", deck: "1.9.0" },
+    parseStoreApps(STORE),
+  );
+  assertEquals(c.map((x) => x.app), ["calendar", "deck", "notes"]);
+  assertEquals(c[0], {
+    app: "calendar",
+    installedVersion: "6.6.1",
+    compatible: true,
+    installedReleaseCompatible: true,
+    newestCompatibleVersion: "6.6.2",
+  });
+  assertEquals(c[1].compatible, false);
+  assertEquals(c[1].newestCompatibleVersion, null);
+  // notes has a compatible release, but the upgrade must update it to reach it.
+  assertEquals(c[2].compatible, true);
+  assertEquals(c[2].installedReleaseCompatible, false);
+});
+
+Deno.test("parseAppList accepts an empty filtered list only when asked", () => {
+  const empty = '{"enabled":[],"disabled":[]}';
+  assertThrows(() => parseAppList(empty), Error, "no enabled apps");
+  assertEquals(parseAppList(empty, true).enabled, {});
+});
+
+const STORE_APPS = "app:list --shipped=false --output=json";
+
+Deno.test("apps with targetVersion checks only store apps against the store", async () => {
+  const h = harness({
+    "app:list --output=json": APPLIST,
+    [SHOWONLY]: ok("All apps are up-to-date or no updates could be found\n"),
+    [STORE_APPS]: ok('{"enabled":{"calendar":"6.6.1","deck":"1.9.0"}}'),
+  });
+  let asked = "";
+  await withFetch((url) => {
+    asked = url;
+    return json(STORE);
+  }, async () => {
+    await run("apps", { targetVersion: "v35.0.1" }, h.context);
+  });
+  assertEquals(asked, "https://apps.nextcloud.com/api/v1/platform/35.0.1/apps.json");
+  assertEquals(h.written.apps.targetVersion, "35.0.1");
+  assertEquals(h.written.apps.incompatible, ["deck"]);
+});
+
+Deno.test("apps without targetVersion does not call the store", async () => {
+  const h = harness({
+    "app:list --output=json": APPLIST,
+    [SHOWONLY]: ok(""),
+  });
+  await withFetch(() => {
+    throw new Error("no fetch expected");
+  }, async () => {
+    await run("apps", {}, h.context);
+  });
+  assertEquals(h.written.apps.compatibility, null);
+  assertEquals(h.written.apps.incompatible, null);
+});
+
+Deno.test("apps raises an app store failure instead of reading compatible", async () => {
+  const h = harness({
+    "app:list --output=json": APPLIST,
+    [SHOWONLY]: ok(""),
+    [STORE_APPS]: ok('{"enabled":{"calendar":"6.6.1"}}'),
+  });
+  await withFetch(() => new Response("busy", { status: 503 }), async () => {
+    await assertRejects(
+      () => run("apps", { targetVersion: "35.0.1" }, h.context),
+      Error,
+      "HTTP 503",
+    );
+  });
+});
+
+Deno.test("apps refuses a targetVersion that is not a stable version", async () => {
+  const h = harness({
+    "app:list --output=json": APPLIST,
+    [SHOWONLY]: ok(""),
+  });
+  await assertRejects(
+    () => run("apps", { targetVersion: "35.0.0rc2" }, h.context),
+    Error,
+    "not a stable",
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * backup: verification helpers
+ * ------------------------------------------------------------------ */
+
+const bytesStream = (b: Uint8Array<ArrayBuffer> | string) =>
+  new Blob([typeof b === "string" ? new TextEncoder().encode(b) : b]).stream();
+
+const DUMP = [
+  "-- MariaDB dump 10.19  Distrib 11.8.9-MariaDB",
+  "CREATE TABLE `oc_a` (",
+  "  `id` int",
+  ");",
+  "CREATE TABLE `oc_b` (`id` int);",
+  "CREATE TABLE `oc_c` (`id` int);",
+  "-- Dump completed on 2026-09-25 15:00:00",
+  "",
+].join("\n");
+
+Deno.test("inspectDump counts tables and finds the completion line", async () => {
+  assertEquals(await inspectDump(bytesStream(DUMP)), {
+    createTables: 3,
+    complete: true,
+  });
+});
+
+Deno.test("inspectDump reports a dump cut short", async () => {
+  const cut = DUMP.slice(0, DUMP.indexOf("CREATE TABLE `oc_c`"));
+  assertEquals(await inspectDump(bytesStream(cut)), {
+    createTables: 2,
+    complete: false,
+  });
+});
+
+/** One ustar entry: header plus content padded to 512 bytes. */
+function tarEntry(
+  name: string,
+  content: string,
+  type = "0",
+): Uint8Array<ArrayBuffer> {
+  const enc = new TextEncoder();
+  const body = enc.encode(content);
+  const h = new Uint8Array(512);
+  const put = (s: string, off: number) => h.set(enc.encode(s), off);
+  put(name.slice(0, 100), 0);
+  put("0000644\0", 100);
+  put("0000000\0", 108);
+  put("0000000\0", 116);
+  put(body.length.toString(8).padStart(11, "0") + "\0", 124);
+  put("00000000000\0", 136);
+  h.fill(32, 148, 156);
+  put(type, 156);
+  put("ustar\0", 257);
+  put("00", 263);
+  let sum = 0;
+  for (const b of h) sum += b;
+  put(sum.toString(8).padStart(6, "0") + "\0 ", 148);
+  const out = new Uint8Array(512 + Math.ceil(body.length / 512) * 512);
+  out.set(h);
+  out.set(body, 512);
+  return out;
+}
+
+async function gzip(
+  parts: Uint8Array<ArrayBuffer>[],
+): Promise<Uint8Array<ArrayBuffer>> {
+  const stream = new Blob(parts).stream().pipeThrough(
+    new CompressionStream("gzip"),
+  );
+  return new Uint8Array(await new Response(stream).arrayBuffer());
+}
+
+const LONG = "custom_apps/" + "x".repeat(120) + "/appinfo/info.xml";
+
+async function goodTar(): Promise<Uint8Array<ArrayBuffer>> {
+  return await gzip([
+    tarEntry("config/", "", "5"),
+    tarEntry("config/config.php", "<?php $CONFIG = [];\n"),
+    tarEntry("././@LongLink", LONG + "\0", "L"),
+    tarEntry(LONG.slice(0, 100), "<info/>"),
+    new Uint8Array(1024),
+  ]);
+}
+
+Deno.test("listTarGz lists entries, including GNU long names", async () => {
+  assertEquals(await listTarGz(bytesStream(await goodTar())), [
+    "config/",
+    "config/config.php",
+    LONG,
+  ]);
+});
+
+Deno.test("listTarGz refuses an archive with no end-of-archive marker", async () => {
+  const cut = await gzip([tarEntry("config/config.php", "<?php\n")]);
+  await assertRejects(
+    () => listTarGz(bytesStream(cut)),
+    Error,
+    "end-of-archive",
+  );
+});
+
+Deno.test("listTarGz refuses a corrupted header", async () => {
+  const entry = tarEntry("config/config.php", "<?php\n");
+  entry[0] = "X".charCodeAt(0);
+  const bad = await gzip([entry, new Uint8Array(1024)]);
+  await assertRejects(() => listTarGz(bytesStream(bad)), Error, "checksum");
+});
+
+Deno.test("listTarGz refuses a truncated gzip stream", async () => {
+  const whole = await goodTar();
+  await assertRejects(() =>
+    listTarGz(bytesStream(whole.slice(0, whole.length - 12)))
+  );
+});
+
+Deno.test("sha256Hex matches the known digest of 'abc'", async () => {
+  assertEquals(
+    await sha256Hex(bytesStream("abc")),
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+  );
+});
+
+Deno.test("parseDu reads du -sk output", () => {
+  assertEquals(parseDu("164\tconfig\n321000\tcustom_apps\n"), {
+    config: 164,
+    custom_apps: 321000,
+  });
+});
+
+Deno.test("backupStamp is sortable and file-name safe", () => {
+  assertEquals(
+    backupStamp(new Date("2026-09-25T15:15:00.123Z")),
+    "20260925T151500Z",
+  );
+});
+
+/* ------------------------------------------------------------------ *
+ * backup: the password never reaches a command line
+ * ------------------------------------------------------------------ */
+
+const DB = { user: "root", name: "nextcloud", passwordEnv: "MARIADB_ROOT_PASSWORD" };
+
+Deno.test("database scripts name the password variable, never a value", () => {
+  for (const s of [tableCountScript(DB), dumpScript(DB)]) {
+    assert(s.includes('MYSQL_PWD="$MARIADB_ROOT_PASSWORD"'), s);
+    assert(!/-p\S|--password/.test(s), s);
+  }
+  assert(dumpScript(DB).includes("--single-transaction"));
+});
+
+Deno.test("a database script survives the ssh round trip as one quoted argument", () => {
+  const { cmd, args } = dockerExecArgv(
+    { ...TRANSPORT, sshHost: "nas" },
+    "db",
+    null,
+    ["sh", "-c", tableCountScript(DB)],
+  );
+  assertEquals(cmd, "ssh");
+  const remote = args[args.length - 1];
+  assert(remote.startsWith("docker exec db sh -c '"), remote);
+  // The SQL's own single quotes are escaped for the remote shell.
+  assert(remote.includes(`table_schema = '"'"'nextcloud'"'"'`), remote);
+});
+
+Deno.test("backup rejects arguments that could inject into a shell", () => {
+  // deno-lint-ignore no-explicit-any
+  const schema = (model.methods as any).backup.arguments;
+  const base = { destDir: "/backups", dbContainer: "db" };
+  assert(schema.safeParse(base).success);
+  for (
+    const bad of [
+      { dbPasswordEnv: "X; rm -rf /" },
+      { dbPasswordEnv: "lower" },
+      { dbName: "nc'; DROP" },
+      { paths: ["../etc"] },
+      { paths: ["config/.."] },
+      { destDir: "relative/dir" },
+    ]
+  ) {
+    assertEquals(
+      schema.safeParse({ ...base, ...bad }).success,
+      false,
+      JSON.stringify(bad),
+    );
+  }
+});
+
+/* ------------------------------------------------------------------ *
+ * backup: the method, against a scripted container
+ * ------------------------------------------------------------------ */
+
+function fakeExec(
+  opts: { tables?: string; dump?: string; tar?: Uint8Array; dumpCode?: number },
+) {
+  const specs: ExecSpec[] = [];
+  const exec = async (spec: ExecSpec): Promise<OccResult> => {
+    specs.push(spec);
+    const cmd = spec.command.join(" ");
+    if (spec.stdoutFile) {
+      const isTar = spec.command[0] === "tar";
+      await Deno.writeFile(
+        spec.stdoutFile,
+        isTar ? opts.tar! : new TextEncoder().encode(opts.dump ?? DUMP),
+        { createNew: true, mode: 0o600 },
+      );
+      return {
+        code: isTar ? 0 : (opts.dumpCode ?? 0),
+        stdout: "",
+        stderr: isTar ? "" : "mariadb-dump: Got error 2013",
+      };
+    }
+    if (cmd.includes("information_schema")) {
+      return { code: 0, stdout: `${opts.tables ?? "3"}\n`, stderr: "" };
+    }
+    if (cmd.includes("du -sk")) {
+      return {
+        code: 0,
+        stdout: "164\tconfig\n2048\tcustom_apps\n60\tthemes\n",
+        stderr: "",
+      };
+    }
+    return { code: 99, stdout: "", stderr: `unscripted: ${cmd}` };
+  };
+  return { exec, specs };
+}
+
+async function backupContext(opts: Parameters<typeof fakeExec>[0]) {
+  const h = harness({ "status --output=json": ok(JSON.stringify(STATUS)) });
+  const f = fakeExec({ tar: await goodTar(), ...opts });
+  return { h, f, context: { ...h.context, exec: f.exec } };
+}
+
+const BACKUP_ARGS = {
+  label: "nc",
+  dbContainer: "db",
+  dbName: "nextcloud",
+  dbUser: "root",
+  dbPasswordEnv: "MARIADB_ROOT_PASSWORD",
+  webRoot: "/var/www/html",
+  paths: ["config", "custom_apps", "themes"],
+};
+
+async function onlyEntry(dir: string): Promise<string> {
+  const names: string[] = [];
+  for await (const e of Deno.readDir(dir)) names.push(e.name);
+  assertEquals(names.length, 1, names.join(", "));
+  return `${dir}/${names[0]}`;
+}
+
+Deno.test("backup dry run measures and writes nothing", async () => {
+  const dest = await Deno.makeTempDir();
+  const { h, f, context } = await backupContext({});
+  await run("backup", { ...BACKUP_ARGS, destDir: dest, apply: false }, context);
+  const entries: string[] = [];
+  for await (const e of Deno.readDir(dest)) entries.push(e.name);
+  assertEquals(entries, []);
+  assertEquals(f.specs.some((s) => s.stdoutFile), false);
+  assertEquals(h.written.backup.applied, false);
+  assertEquals(h.written.backup.verified, false);
+  // deno-lint-ignore no-explicit-any
+  assertEquals((h.written.backup.database as any).liveTables, 3);
+  // deno-lint-ignore no-explicit-any
+  assertEquals((h.written.backup.archive as any).sourceKiB.config, 164);
+  await Deno.remove(dest, { recursive: true });
+});
+
+Deno.test("backup apply writes, reads back and verifies", async () => {
+  const dest = await Deno.makeTempDir();
+  const { h, context } = await backupContext({});
+  await run("backup", { ...BACKUP_ARGS, destDir: dest, apply: true }, context);
+  const dir = await onlyEntry(dest);
+  assert(/\/nc-\d{8}T\d{6}Z$/.test(dir), dir);
+  assertEquals((await Deno.stat(dir)).mode! & 0o777, 0o700);
+  for (const name of ["nextcloud.sql", "files.tar.gz", "SHA256SUMS", "BACKUP.json"]) {
+    assertEquals((await Deno.stat(`${dir}/${name}`)).mode! & 0o777, 0o600, name);
+  }
+  const sums = await Deno.readTextFile(`${dir}/SHA256SUMS`);
+  assert(sums.includes(`${await sha256Hex(bytesStream(DUMP))}  nextcloud.sql`));
+  const b = h.written.backup;
+  assertEquals(b.verified, true);
+  assertEquals(b.problems, []);
+  assertEquals(b.directory, dir);
+  // deno-lint-ignore no-explicit-any
+  assertEquals((b.database as any).dumpedTables, 3);
+  // deno-lint-ignore no-explicit-any
+  assertEquals((b.archive as any).hasConfigPhp, true);
+  const self = JSON.parse(await Deno.readTextFile(`${dir}/BACKUP.json`));
+  assertEquals(self.nextcloudVersion, "34.0.4");
+  await Deno.remove(dest, { recursive: true });
+});
+
+Deno.test("backup apply renames a dump that was cut short .FAILED and throws", async () => {
+  const dest = await Deno.makeTempDir();
+  const cut = DUMP.slice(0, DUMP.indexOf("-- Dump completed"));
+  const { h, context } = await backupContext({ dump: cut, dumpCode: 2 });
+  await assertRejects(
+    () => run("backup", { ...BACKUP_ARGS, destDir: dest, apply: true }, context),
+    Error,
+    "failed verification",
+  );
+  const dir = await onlyEntry(dest);
+  assert(dir.endsWith(".FAILED"), dir);
+  assertEquals(h.written.backup.verified, false);
+  const problems = h.written.backup.problems as string[];
+  assert(problems.some((p) => p.includes("exited 2")), problems.join(" | "));
+  assert(problems.some((p) => p.includes("cut short")), problems.join(" | "));
+  await Deno.remove(dest, { recursive: true });
+});
+
+Deno.test("backup apply fails when the dump has fewer tables than the database", async () => {
+  const dest = await Deno.makeTempDir();
+  const { h, context } = await backupContext({ tables: "4" });
+  await assertRejects(
+    () => run("backup", { ...BACKUP_ARGS, destDir: dest, apply: true }, context),
+    Error,
+    "creates 3 tables; the database has 4",
+  );
+  assertEquals(h.written.backup.verified, false);
+  await Deno.remove(dest, { recursive: true });
+});
+
+Deno.test("backup refuses a database with no tables before writing anything", async () => {
+  const dest = await Deno.makeTempDir();
+  const { f, context } = await backupContext({ tables: "0" });
+  await assertRejects(
+    () => run("backup", { ...BACKUP_ARGS, destDir: dest, apply: true }, context),
+    Error,
+    "wrong database",
+  );
+  assertEquals(f.specs.some((s) => s.stdoutFile), false);
+  await Deno.remove(dest, { recursive: true });
+});
+
+Deno.test("backup apply refuses a destDir that does not exist", async () => {
+  const { context } = await backupContext({});
+  await assertRejects(
+    () =>
+      run("backup", {
+        ...BACKUP_ARGS,
+        destDir: "/nonexistent-backup-root",
+        apply: true,
+      }, context),
+    Error,
+    "not an existing directory",
+  );
 });
