@@ -1,9 +1,10 @@
 # @sntxrr/nextcloud
 
-Health, version drift, setup checks, app updates and `occ` maintenance for a
-self-hosted [Nextcloud](https://nextcloud.com).
+Health, version drift, setup checks, app updates and compatibility, verified
+backups and `occ` maintenance for a self-hosted
+[Nextcloud](https://nextcloud.com).
 
-One model type, `@sntxrr/nextcloud/instance`, with seven methods over two
+One model type, `@sntxrr/nextcloud/instance`, with eight methods over two
 transports.
 
 | Method        | Transport | Changes state                   | Resource      |
@@ -15,6 +16,7 @@ transports.
 | `maintenance` | occ       | **dry run unless `apply=true`** | `maintenance` |
 | `dbRepair`    | occ       | **dry run unless `apply=true`** | `dbRepair`    |
 | `updateApps`  | occ       | **dry run unless `apply=true`** | `appUpdate`   |
+| `backup`      | docker    | **dry run unless `apply=true`** | `backup`      |
 
 Every apply path re-reads the state after acting and **fails if the change did
 not take**. For example, `dbRepair` runs a second `--dry-run` and requires it to
@@ -41,6 +43,7 @@ swamp model create @sntxrr/nextcloud/instance cloud \
 | `imageRepository` / `imageVariant`    | `nextcloud` / `apache`                       | Builds the tag to offer, e.g. `nextcloud:34.0.4-apache`.                                         |
 | `verifyRegistry` / `verifyRepository` | `registry-1.docker.io` / `library/nextcloud` | Where image existence is checked.                                                                |
 | `githubToken`                         | —                                            | Optional, sensitive. Only raises the GitHub rate limit.                                          |
+| `appStoreUrl`                         | `https://apps.nextcloud.com`                 | Used by `apps` with a `targetVersion`.                                                           |
 
 ### The serverinfo token
 
@@ -49,11 +52,77 @@ It authenticates with a **serverinfo token**, not an account. The token grants
 access to that one monitoring endpoint and nothing else:
 
 ```bash
-occ config:app:set serverinfo token --value "$(openssl rand -hex 32)"
+token="$(openssl rand -hex 32)"
+printf '{"apps":{"serverinfo":{"token":"%s"}}}' "$token" |
+  ssh nas.example.com docker exec -i -u www-data nextcloud php occ config:import
 ```
 
-Store it in a vault and reference it from the model. Without a token, `sync`
+`config:import` reads stdin when given no file, and sets only the keys it is
+given. `occ config:app:set serverinfo token --value …` works too, but it puts
+the token in a command line that any local user on the host can read with `ps`.
+Store the token in a vault and reference it from the model. Without a token, `sync`
 reads `status.php` only.
+
+## Upgrading a major version
+
+The image bump belongs to whatever deploys the container. Everything around it
+is a method:
+
+| Step                          | Method                              | Gate on                                   |
+| ----------------------------- | ----------------------------------- | ----------------------------------------- |
+| Name the target               | `drift`                             | `status == behind-major`, `nextMajor`     |
+| Check apps against the target | `apps --arg targetVersion=<next>`   | `incompatible` is empty                   |
+| Make the rollback point       | `backup --arg apply=true`           | `verified`                                |
+| _Bump the image and deploy_   | _your deploy_                       |                                           |
+| Confirm it took               | `sync`                              | `versionString`, `healthy`                |
+| Add what the upgrade left out | `dbRepair`, then with `apply=true`  | `pending`                                 |
+| Nothing new is broken         | `setupchecks`                       | `errors`                                  |
+
+`apps` with a `targetVersion` checks only apps that are not shipped with the
+server, since shipped apps upgrade with it. For each it reports whether the app
+store has any stable release for the target (`compatible`) and whether the
+installed release is one of them (`installedReleaseCompatible`). An app that is
+compatible but whose installed release is not has to be updated during the
+upgrade. The app store answers for any version string, including one that was
+never released, so pass a real release such as `drift`'s `nextMajor`.
+
+### `backup`
+
+```bash
+swamp model @sntxrr/nextcloud/instance method run backup cloud \
+  --arg destDir=/srv/backups --arg dbContainer=nextcloud-db --arg apply=true
+```
+
+It writes `<destDir>/<label>-<UTC timestamp>/` on the machine swamp runs on,
+with mode 700 on the directory and 600 on the files:
+
+| File           | Contents                                                              |
+| -------------- | --------------------------------------------------------------------- |
+| `<db>.sql`     | `mariadb-dump`/`mysqldump --single-transaction`, streamed over SSH    |
+| `files.tar.gz` | `paths` under the web root: `config`, `custom_apps`, `themes` by default |
+| `SHA256SUMS`   | `shasum -a 256 -c SHA256SUMS` checks both                             |
+| `BACKUP.json`  | The resource, so the directory describes itself                       |
+
+The defaults are what an upgrade changes. User files in `data` are not, and can
+be large; add `data` to `paths` to include them.
+
+Both files are **read back** before the backup counts as verified. The dump
+must end with `-- Dump completed` and create as many tables as the database had
+before the dump; a dump cut short is still valid SQL up to the cut, so this is
+the only way to catch one. The archive must reach its end-of-archive marker
+with every header checksum and the gzip CRC intact. A backup that fails any
+check is renamed `<dir>.FAILED`, recorded with `verified: false` and its
+`problems`, and the method fails.
+
+A run killed partway, before any check could run, leaves a directory with no
+`BACKUP.json`. Only a directory whose `BACKUP.json` says `"verified": true` is
+a rollback point.
+
+The database password is **never in a command line**. `dbPasswordEnv` names an
+environment variable the database container already has (default
+`MARIADB_ROOT_PASSWORD`; the mysql image uses `MYSQL_ROOT_PASSWORD`), and the
+client reads it as `MYSQL_PWD` inside the container. Only MySQL and MariaDB are
+supported.
 
 ## Three behaviours worth knowing
 
@@ -127,7 +196,9 @@ not parse. Two examples of the last case:
 | `instance`    | `healthy`                                    |
 | `drift`       | `behind`                                     |
 | `setupchecks` | `errors`, `warnings` (details in `problems`) |
-| `apps`        | `hasUpdates`                                 |
+| `apps`        | `hasUpdates`; `incompatible` with a target   |
+| `dbRepair`    | `pending`                                    |
+| `backup`      | `verified` (details in `problems`)           |
 
 Each resource has a fixed name (`instance-current`, `drift-current`, and so on),
 so workflow expressions can use `data.latest('<model>', '<name>')` without

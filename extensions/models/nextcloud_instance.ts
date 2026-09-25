@@ -2,7 +2,7 @@
  * Nextcloud instance — health, version drift, app updates and `occ`
  * maintenance for a self-hosted {@link https://nextcloud.com | Nextcloud}.
  *
- * Seven methods over two transports.
+ * Eight methods over two transports.
  *
  * Over HTTP, needing no credential beyond an optional read-only token:
  *
@@ -12,13 +12,37 @@
  * - `drift` compares the running version against Nextcloud's published stable
  *   releases and reports the patch target and the next major separately.
  *
- * Over `occ`, run with `docker exec` either locally or on a host over SSH:
+ * Over `occ` and `docker exec`, run either locally or on a host over SSH:
  *
  * - `setupchecks` — the admin overview's warnings, as data. Read-only.
- * - `apps` — installed apps and the ones with updates available. Read-only.
+ * - `apps` — installed apps and the ones with updates available, and with a
+ *   `targetVersion`, which store apps have no release for that version.
+ *   Read-only.
  * - `maintenance` — turn maintenance mode on or off.
  * - `dbRepair` — add missing indices, columns and primary keys.
  * - `updateApps` — update apps from the app store.
+ * - `backup` — dump the database and archive the web-root directories an
+ *   upgrade changes, onto the machine swamp runs on, then read both back.
+ *
+ * Together they cover a major upgrade except the image bump itself, which
+ * belongs to whatever deploys the container: `drift` names the target, `apps`
+ * with that target shows what the upgrade would disable, `backup` makes the
+ * rollback point, and after the deploy `sync`, `dbRepair` and `setupchecks`
+ * confirm it took.
+ *
+ * ## Why `backup` verifies by reading back
+ *
+ * A dump cut short by a dropped connection is still valid SQL up to the cut,
+ * and a truncated archive still lists its first entries, so an exit status of
+ * 0 and a non-empty file prove little. `backup` reads both files back from
+ * disk: the dump must end with `-- Dump completed` and create as many tables
+ * as the database had, and the archive must reach its end-of-archive marker
+ * with every header checksum and the gzip CRC intact. A backup that fails any
+ * check is renamed with a `.FAILED` suffix, so it cannot be mistaken for a
+ * rollback point. The database password is read from an environment variable
+ * inside the database container and handed to the client as `MYSQL_PWD`, so
+ * it never appears in a command line, which on a shared host any local user
+ * can read with `ps`.
  *
  * **Every method that changes state is a dry run unless `apply: true`.** A dry
  * run reports what would change and changes nothing; the apply path re-reads
@@ -77,10 +101,13 @@
  *
  * @module
  */
+import { createHash } from "node:crypto";
 import { z } from "npm:zod@4";
 
 const NAME_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]*$/;
 const APP_ID_PATTERN = /^[a-z0-9_]+$/;
+const ENV_NAME_PATTERN = /^[A-Z_][A-Z0-9_]*$/;
+const WEBROOT_PATH_PATTERN = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
 
 const GlobalArgsSchema = z.object({
   baseUrl: z.string().url().describe(
@@ -93,11 +120,13 @@ const GlobalArgsSchema = z.object({
   // after the multi-line describe(): the push-time safety analyzer reads the
   // field's declaration LINE.
   serverinfoToken: z.string().meta({ sensitive: true }).optional().describe(
-    "Optional serverinfo token, sent as the `NC-Token` header. Set on the " +
-      "instance with `occ config:app:set serverinfo token --value <token>`. It " +
-      "grants read access to the monitoring endpoint only, not an account, so " +
-      "it is the least-privileged way to read storage and user statistics. " +
-      "Without it `sync` reads `status.php` alone. Supply it from a vault.",
+    "Optional serverinfo token, sent as the `NC-Token` header. Set it on the " +
+      'instance by piping `{"apps":{"serverinfo":{"token":"..."}}}` into ' +
+      "`occ config:import` on stdin, which keeps it out of the command line " +
+      "that `occ config:app:set --value` would put it in. It grants read " +
+      "access to the monitoring endpoint only, not an account, so it is the " +
+      "least-privileged way to read storage and user statistics. Without it " +
+      "`sync` reads `status.php` alone. Supply it from a vault.",
   ),
   sshHost: z.string().optional().describe(
     "Host to run `occ` on over SSH. Omit to run `docker exec` locally, on the " +
@@ -148,6 +177,10 @@ const GlobalArgsSchema = z.object({
   verifyRepository: z.string().default("library/nextcloud").describe(
     "Repository path within `verifyRegistry`. Docker Hub official images live " +
       "under `library/`.",
+  ),
+  appStoreUrl: z.string().url().default("https://apps.nextcloud.com").describe(
+    "Nextcloud app store, used by `apps` with a `targetVersion` to check " +
+      "which installed store apps have a release for that version.",
   ),
   timeoutMs: z.number().int().positive().default(10_000).describe(
     "Abort each HTTP call after this long.",
@@ -300,6 +333,19 @@ const AppUpdateSchema = z.object({
   availableVersion: z.string(),
 });
 
+const AppCompatibilitySchema = z.object({
+  app: z.string(),
+  installedVersion: z.string(),
+  compatible: z.boolean().describe(
+    "The app store lists at least one stable release for the target version.",
+  ),
+  installedReleaseCompatible: z.boolean().describe(
+    "The installed release itself is listed for the target version. When " +
+      "false but `compatible` is true, the upgrade has to update the app too.",
+  ),
+  newestCompatibleVersion: z.string().nullable(),
+});
+
 const AppsSchema = z.object({
   enabled: z.record(z.string(), z.string()).describe("App id → version."),
   disabled: z.record(z.string(), z.string()).describe("App id → version."),
@@ -309,6 +355,19 @@ const AppsSchema = z.object({
     "Apps with a newer store release, as `occ app:update --showonly` reports.",
   ),
   hasUpdates: z.boolean().describe("The single field to alert on."),
+  targetVersion: z.string().nullable().describe(
+    "The Nextcloud version compatibility was checked against. Null when no " +
+      "targetVersion was given.",
+  ),
+  compatibility: z.array(AppCompatibilitySchema).nullable().describe(
+    "One entry per enabled app that is not shipped with the server. Shipped " +
+      "apps upgrade with the server and are not listed. Null when no " +
+      "targetVersion was given.",
+  ),
+  incompatible: z.array(z.string()).nullable().describe(
+    "Enabled store apps with no stable release for targetVersion. Non-empty " +
+      "means the upgrade would disable them. The field to gate an upgrade on.",
+  ),
   checkedAt: z.iso.datetime(),
 });
 
@@ -357,6 +416,62 @@ const AppUpdateRunSchema = z.object({
   stillPending: z.array(z.string()).describe(
     "Planned apps that still report an update after applying. Non-empty " +
       "fails the method.",
+  ),
+  checkedAt: z.iso.datetime(),
+});
+
+const BackupFileSchema = z.object({
+  name: z.string().describe("File name within the backup directory."),
+  bytes: z.number().int(),
+  sha256: z.string(),
+});
+
+const BackupSchema = z.object({
+  applied: z.boolean().describe("False for a dry run, which writes nothing."),
+  verified: z.boolean().describe(
+    "Every check below passed. Only a verified backup is a rollback point. " +
+      "The field to gate an upgrade on.",
+  ),
+  directory: z.string().nullable().describe(
+    "Where the backup was written, on the machine swamp runs on. A backup " +
+      "that fails verification is renamed with a `.FAILED` suffix.",
+  ),
+  nextcloudVersion: z.string().describe(
+    "Version running when the backup was taken, from `occ status`. A " +
+      "restore must run this version's image.",
+  ),
+  database: z.object({
+    container: z.string(),
+    name: z.string(),
+    liveTables: z.number().int().describe(
+      "Tables in the database, counted before the dump.",
+    ),
+    dumpedTables: z.number().int().nullable().describe(
+      "CREATE TABLE statements in the dump. Null for a dry run.",
+    ),
+    dumpComplete: z.boolean().nullable().describe(
+      "The dump ends with mysqldump's `-- Dump completed` line, so it was " +
+        "not cut short. Null for a dry run.",
+    ),
+  }),
+  archive: z.object({
+    paths: z.array(z.string()).describe(
+      "Directories under the web root that were archived.",
+    ),
+    sourceKiB: z.record(z.string(), z.number().int()).describe(
+      "Size of each path on the instance, from `du -sk`.",
+    ),
+    entries: z.number().int().nullable().describe(
+      "Entries read back from the written archive. Null for a dry run.",
+    ),
+    hasConfigPhp: z.boolean().nullable().describe(
+      "The archive contains config/config.php. Null for a dry run or when " +
+        "`config` was not archived.",
+    ),
+  }),
+  files: z.array(BackupFileSchema),
+  problems: z.array(z.string()).describe(
+    "Every verification that failed. Non-empty fails the method.",
   ),
   checkedAt: z.iso.datetime(),
 });
@@ -738,6 +853,15 @@ export function shellQuote(arg: string): string {
   return `'${arg.replaceAll("'", `'"'"'`)}'`;
 }
 
+type TransportArgs = Pick<
+  GlobalArgs,
+  | "sshHost"
+  | "sshUser"
+  | "strictHostKeyChecking"
+  | "knownHostsFile"
+  | "dockerBin"
+>;
+
 /**
  * Build the argv that runs `occ` with the given arguments.
  *
@@ -748,28 +872,33 @@ export function shellQuote(arg: string): string {
  * the only one.
  */
 export function occArgv(
-  g: Pick<
-    GlobalArgs,
-    | "sshHost"
-    | "sshUser"
-    | "strictHostKeyChecking"
-    | "knownHostsFile"
-    | "dockerBin"
-    | "container"
-    | "occUser"
-  >,
+  g: TransportArgs & Pick<GlobalArgs, "container" | "occUser">,
   occArgs: string[],
 ): { cmd: string; args: string[] } {
-  const docker = [
-    "exec",
-    "-u",
-    g.occUser,
-    g.container,
+  return dockerExecArgv(g, g.container, g.occUser, [
     "php",
     "occ",
     "--no-interaction",
     "--no-ansi",
     ...occArgs,
+  ]);
+}
+
+/**
+ * Build the argv that runs a command in a container with `docker exec`,
+ * locally or over SSH. `user` null runs as the container's default user.
+ */
+export function dockerExecArgv(
+  g: TransportArgs,
+  container: string,
+  user: string | null,
+  command: string[],
+): { cmd: string; args: string[] } {
+  const docker = [
+    "exec",
+    ...(user ? ["-u", user] : []),
+    container,
+    ...command,
   ];
   if (!g.sshHost) return { cmd: g.dockerBin, args: docker };
 
@@ -880,8 +1009,14 @@ export function parseSetupChecks(stdout: string) {
   return checks;
 }
 
-/** Parse `occ app:list --output=json`. */
-export function parseAppList(stdout: string): {
+/**
+ * Parse `occ app:list --output=json`.
+ *
+ * @param allowEmpty Accept an empty enabled list. Only right when the listing
+ *   is filtered, as `--shipped=false` is: an instance may have no store apps,
+ *   but it always has shipped ones.
+ */
+export function parseAppList(stdout: string, allowEmpty = false): {
   enabled: Record<string, string>;
   disabled: Record<string, string>;
 } {
@@ -904,7 +1039,7 @@ export function parseAppList(stdout: string): {
     );
   };
   const enabled = asMap(doc.enabled);
-  if (Object.keys(enabled).length === 0) {
+  if (!allowEmpty && Object.keys(enabled).length === 0) {
     throw new Error(
       "occ app:list reported no enabled apps; a working instance always has " +
         "some, so this output is not trusted",
@@ -988,6 +1123,314 @@ export function parseRepairDryRun(
 }
 
 /* ------------------------------------------------------------------ *
+ * App store compatibility
+ * ------------------------------------------------------------------ */
+
+/**
+ * Parse the app store's `/api/v1/platform/<version>/apps.json` into app id →
+ * stable release versions. The endpoint lists only releases whose platform
+ * range includes that version, so presence is compatibility. Nightly releases
+ * are dropped.
+ */
+export function parseStoreApps(body: unknown): Map<string, string[]> {
+  if (!Array.isArray(body)) {
+    throw new Error("app store response is not a list of apps");
+  }
+  const out = new Map<string, string[]>();
+  for (const a of body as Array<Record<string, unknown>>) {
+    if (typeof a?.id !== "string" || !Array.isArray(a.releases)) continue;
+    const versions = (a.releases as Array<Record<string, unknown>>)
+      .filter((r) => typeof r?.version === "string" && r.isNightly !== true)
+      .map((r) => r.version as string);
+    if (versions.length > 0) out.set(a.id, versions);
+  }
+  return out;
+}
+
+/** Newest of a list of app versions; unparseable ones only as a fallback. */
+function newestVersion(versions: string[]): string | null {
+  const parsed = versions
+    .map((v) => ({ v, p: parseVersion(v) }))
+    .filter((x): x is { v: string; p: ParsedVersion } => x.p !== null)
+    .sort((a, b) => compareVersions(b.p, a.p));
+  return parsed[0]?.v ?? versions[0] ?? null;
+}
+
+/**
+ * Compare installed store apps against what the app store lists for a
+ * target version.
+ */
+export function computeCompatibility(
+  installed: Record<string, string>,
+  store: Map<string, string[]>,
+): z.infer<typeof AppCompatibilitySchema>[] {
+  return Object.entries(installed)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([app, installedVersion]) => {
+      const versions = store.get(app) ?? [];
+      return {
+        app,
+        installedVersion,
+        compatible: versions.length > 0,
+        installedReleaseCompatible: versions.includes(installedVersion),
+        newestCompatibleVersion: newestVersion(versions),
+      };
+    });
+}
+
+/* ------------------------------------------------------------------ *
+ * Backup verification
+ * ------------------------------------------------------------------ */
+
+/**
+ * Read a SQL dump as a stream and report how many tables it creates and
+ * whether it ends with mysqldump's completion line. A dump cut short by a
+ * dropped connection or a full disk is still valid SQL up to the cut, so
+ * the missing last line is the only sign.
+ */
+export async function inspectDump(
+  stream: ReadableStream<Uint8Array>,
+): Promise<{ createTables: number; complete: boolean }> {
+  let createTables = 0;
+  let last = "";
+  let pending = "";
+  const take = (line: string) => {
+    if (/^CREATE TABLE /.test(line)) createTables++;
+    if (line.trim() !== "") last = line;
+  };
+  for await (
+    const chunk of stream.pipeThrough(new TextDecoderStream())
+  ) {
+    const lines = (pending + chunk).split("\n");
+    pending = lines.pop() ?? "";
+    lines.forEach(take);
+  }
+  take(pending);
+  return { createTables, complete: /^-- Dump completed/.test(last) };
+}
+
+/** Reads exact byte counts from a stream. */
+class ByteReader {
+  #buf = new Uint8Array(0);
+  #off = 0;
+  constructor(private reader: ReadableStreamDefaultReader<Uint8Array>) {}
+
+  async #fill(): Promise<boolean> {
+    const { value, done } = await this.reader.read();
+    if (done) return false;
+    const rest = this.#buf.subarray(this.#off);
+    const next = new Uint8Array(rest.length + value.length);
+    next.set(rest);
+    next.set(value, rest.length);
+    this.#buf = next;
+    this.#off = 0;
+    return true;
+  }
+
+  async read(n: number): Promise<Uint8Array | null> {
+    while (this.#buf.length - this.#off < n) {
+      if (!(await this.#fill())) return null;
+    }
+    const out = this.#buf.slice(this.#off, this.#off + n);
+    this.#off += n;
+    return out;
+  }
+
+  async skip(n: number): Promise<boolean> {
+    while (n > 0) {
+      const avail = this.#buf.length - this.#off;
+      if (avail === 0) {
+        if (!(await this.#fill())) return false;
+        continue;
+      }
+      const k = Math.min(avail, n);
+      this.#off += k;
+      n -= k;
+    }
+    return true;
+  }
+
+  async drain(): Promise<void> {
+    while (await this.#fill()) this.#off = this.#buf.length;
+  }
+
+  /** Release the underlying stream, and with it the file, after an error. */
+  async cancel(): Promise<void> {
+    await this.reader.cancel().catch(() => {});
+  }
+}
+
+function tarString(block: Uint8Array, start: number, len: number): string {
+  const field = block.subarray(start, start + len);
+  const end = field.indexOf(0);
+  return new TextDecoder().decode(end === -1 ? field : field.subarray(0, end));
+}
+
+function tarNumber(block: Uint8Array, start: number, len: number): number {
+  // GNU tar writes sizes over 8 GiB in base-256, flagged by the high bit.
+  if (block[start] & 0x80) {
+    let n = block[start] & 0x7f;
+    for (let i = start + 1; i < start + len; i++) n = n * 256 + block[i];
+    return n;
+  }
+  const s = tarString(block, start, len).trim();
+  return s === "" ? 0 : parseInt(s, 8);
+}
+
+/**
+ * List the entries of a gzip-compressed tar archive, verifying it on the way.
+ *
+ * Every header checksum is checked, the archive must reach its end-of-archive
+ * marker, and the gzip stream is read to the end so its CRC is checked too.
+ * Any of those failing throws: an archive that cannot be read back in full is
+ * not a backup. Reading it in-process means verification does not depend on
+ * which `tar` the machine swamp runs on has.
+ */
+export async function listTarGz(
+  stream: ReadableStream<Uint8Array>,
+): Promise<string[]> {
+  const reader = new ByteReader(
+    stream.pipeThrough(
+      // lib.dom types the writable side as BufferSource; it takes bytes.
+      new DecompressionStream("gzip") as unknown as TransformStream<
+        Uint8Array,
+        Uint8Array
+      >,
+    ).getReader(),
+  );
+  try {
+    return await readTarEntries(reader);
+  } catch (err) {
+    await reader.cancel();
+    throw err;
+  }
+}
+
+async function readTarEntries(reader: ByteReader): Promise<string[]> {
+  const names: string[] = [];
+  let longName: string | null = null;
+  for (;;) {
+    const header = await reader.read(512);
+    if (!header) {
+      throw new Error("archive ends before its end-of-archive marker");
+    }
+    if (header.every((b) => b === 0)) break;
+
+    const stored = tarNumber(header, 148, 8);
+    let sum = 0;
+    for (let i = 0; i < 512; i++) {
+      sum += i >= 148 && i < 156 ? 32 : header[i];
+    }
+    if (sum !== stored) {
+      throw new Error(
+        `tar header checksum mismatch after ${names.length} entries`,
+      );
+    }
+
+    const type = String.fromCharCode(header[156] || 48);
+    const size = tarNumber(header, 124, 12);
+    const padded = Math.ceil(size / 512) * 512;
+
+    if (type === "L" || type === "x") {
+      const data = await reader.read(padded);
+      if (!data) throw new Error("archive truncated inside an extended header");
+      const text = new TextDecoder().decode(data.subarray(0, size));
+      if (type === "L") longName = text.replace(/\0.*$/s, "");
+      else {
+        const path = text.match(/^\d+ path=(.*)$/m)?.[1];
+        if (path) longName = path;
+      }
+      continue;
+    }
+
+    let name = tarString(header, 0, 100);
+    if (tarString(header, 257, 5) === "ustar") {
+      const prefix = tarString(header, 345, 155);
+      if (prefix) name = `${prefix}/${name}`;
+    }
+    if (longName !== null) {
+      name = longName;
+      longName = null;
+    }
+    if (type !== "g") names.push(name);
+    if (!(await reader.skip(padded))) {
+      throw new Error(`archive truncated inside ${name}`);
+    }
+  }
+  // Read to the end so the gzip trailer's CRC and length are checked.
+  await reader.drain();
+  return names;
+}
+
+/** SHA-256 of a stream, as lowercase hex. */
+export async function sha256Hex(
+  stream: ReadableStream<Uint8Array>,
+): Promise<string> {
+  const hash = createHash("sha256");
+  for await (const chunk of stream) hash.update(chunk);
+  return hash.digest("hex");
+}
+
+/** A command run in a container, optionally with stdout sent to a file. */
+export type ExecSpec = {
+  container: string;
+  user: string | null;
+  command: string[];
+  /** Stream stdout into this new file (mode 600) instead of returning it. */
+  stdoutFile?: string;
+};
+
+/** Runs a command in a container; replaceable in tests. */
+export type ExecRunner = (
+  spec: ExecSpec,
+  timeoutMs: number,
+  signal?: AbortSignal,
+) => Promise<OccResult>;
+
+function processExecRunner(g: GlobalArgs): ExecRunner {
+  return async (spec, timeoutMs, signal) => {
+    const { cmd, args } = dockerExecArgv(
+      g,
+      spec.container,
+      spec.user,
+      spec.command,
+    );
+    // Open the destination before starting anything remote, so a file that
+    // cannot be created never leaves a dump running with nobody reading it.
+    const file = spec.stdoutFile
+      ? await Deno.open(spec.stdoutFile, {
+        write: true,
+        createNew: true,
+        mode: 0o600,
+      })
+      : null;
+    let proc: Deno.ChildProcess;
+    try {
+      proc = new Deno.Command(cmd, {
+        args,
+        stdin: "null",
+        stdout: "piped",
+        stderr: "piped",
+        signal: callSignal(timeoutMs, signal),
+      }).spawn();
+    } catch (err) {
+      file?.close();
+      throw err;
+    }
+    const stderr = new Response(proc.stderr).text();
+    let stdout = "";
+    if (file) {
+      // pipeTo closes the file when the stream ends or errors.
+      await proc.stdout.pipeTo(file.writable);
+    } else {
+      stdout = await new Response(proc.stdout).text();
+    }
+    const status = await proc.status;
+    return { code: status.code, stdout, stderr: await stderr };
+  };
+}
+
+/* ------------------------------------------------------------------ *
  * Method implementations
  * ------------------------------------------------------------------ */
 
@@ -1016,11 +1459,66 @@ async function readAppUpdates(
   }));
 }
 
-/** Test seam: the occ runner, when not the real process. */
-type Deps = { run?: OccRunner };
+/** Test seam: the occ and exec runners, when not the real process. */
+type Deps = { run?: OccRunner; exec?: ExecRunner };
 
 function runnerFor(context: Context & Deps): OccRunner {
   return context.run ?? processRunner(context.globalArgs);
+}
+
+function execFor(context: Context & Deps): ExecRunner {
+  return context.exec ?? processExecRunner(context.globalArgs);
+}
+
+/** Database connection details for `backup`, validated before use. */
+export type DbTarget = { user: string; name: string; passwordEnv: string };
+
+/**
+ * Shell prelude for a command in the database container. The password is
+ * passed to the client as MYSQL_PWD, taken from an environment variable the
+ * container already has, so only the variable's NAME ever appears in a
+ * command line. On a shared host every local user can read command lines
+ * with `ps`; a process environment is readable only by its owner.
+ */
+function dbPrelude(db: DbTarget, clients: [string, string]): string {
+  const [a, b] = clients;
+  return `c=$(command -v ${a} || command -v ${b}) || ` +
+    `{ echo "neither ${a} nor ${b} is in the database container" >&2; exit 127; }; ` +
+    `[ -n "$${db.passwordEnv}" ] || ` +
+    `{ echo "${db.passwordEnv} is not set in the database container" >&2; exit 64; }; ` +
+    `MYSQL_PWD="$${db.passwordEnv}" exec "$c" -u ${db.user}`;
+}
+
+/** Script that prints the number of tables in the database. */
+export function tableCountScript(db: DbTarget): string {
+  return `${dbPrelude(db, ["mariadb", "mysql"])} -N -B -e ` +
+    `"SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = '${db.name}'"`;
+}
+
+/**
+ * Script that writes a consistent dump of the database to stdout.
+ * `--single-transaction` gives a consistent InnoDB snapshot without locking
+ * the tables, so the instance can stay up while it runs.
+ */
+export function dumpScript(db: DbTarget): string {
+  return `${dbPrelude(db, ["mariadb-dump", "mysqldump"])} ` +
+    `--single-transaction --quick --routines --triggers --events ` +
+    `--hex-blob --default-character-set=utf8mb4 ${db.name}`;
+}
+
+/** Parse `du -sk` output into path → KiB. */
+export function parseDu(stdout: string): Record<string, number> {
+  const out: Record<string, number> = {};
+  for (const line of stdout.split("\n")) {
+    const m = line.trim().match(/^(\d+)\s+(.+)$/);
+    if (m) out[m[2]] = parseInt(m[1], 10);
+  }
+  return out;
+}
+
+/** `20260925T151500Z`: sortable, and legal in a file name everywhere. */
+export function backupStamp(d: Date): string {
+  return d.toISOString().replace(/\.\d+Z$/, "Z").replace(/[-:]/g, "");
 }
 
 /**
@@ -1101,14 +1599,26 @@ export async function checkOccReachable(
  * swamp model @sntxrr/nextcloud/instance method run dbRepair cloud
  * swamp model @sntxrr/nextcloud/instance method run dbRepair cloud \
  *   --arg apply=true
+ * swamp model @sntxrr/nextcloud/instance method run apps cloud \
+ *   --arg targetVersion=35.0.1
+ * swamp model @sntxrr/nextcloud/instance method run backup cloud \
+ *   --arg destDir=/srv/backups --arg dbContainer=nextcloud-db --arg apply=true
  * ```
  */
 export const model = {
   type: "@sntxrr/nextcloud/instance",
   description:
-    "Health, version drift, setup checks, app updates and occ maintenance for a self-hosted Nextcloud. Methods that change state are dry runs unless apply=true.",
-  version: "2026.09.24.1",
+    "Health, version drift, setup checks, app updates and compatibility, verified backups and occ maintenance for a self-hosted Nextcloud. Methods that change state are dry runs unless apply=true.",
+  version: "2026.09.25.1",
   globalArguments: GlobalArgsSchema,
+  upgrades: [
+    {
+      toVersion: "2026.09.25.1",
+      description:
+        "Add appStoreUrl (defaults to https://apps.nextcloud.com); existing arguments are unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 
   resources: {
     instance: {
@@ -1155,6 +1665,13 @@ export const model = {
       lifetime: "infinite" as const,
       garbageCollection: 30,
     },
+    backup: {
+      description:
+        "A database dump and web-root archive: where it is and how it was verified.",
+      schema: BackupSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
   },
 
   checks: {
@@ -1162,7 +1679,7 @@ export const model = {
       description:
         "Before a method that can change state, prove occ answers in the configured container and reports an installed Nextcloud.",
       labels: ["live"],
-      appliesTo: ["maintenance", "dbRepair", "updateApps"],
+      appliesTo: ["maintenance", "dbRepair", "updateApps", "backup"],
       execute: (context: { globalArgs: unknown }) =>
         checkOccReachable(context.globalArgs),
     },
@@ -1500,10 +2017,17 @@ export const model = {
 
     apps: {
       description:
-        "List installed apps and the ones with an app store update available. Read-only.",
-      arguments: z.object({}),
+        "List installed apps and the ones with an app store update available. With targetVersion, also check every enabled store app has a stable release for that Nextcloud version. Read-only.",
+      arguments: z.object({
+        targetVersion: z.string().optional().describe(
+          "A Nextcloud version to check app compatibility against, usually " +
+            "`drift`'s `nextMajor`. Give a real release: the app store " +
+            "answers for any version string, and one that does not exist " +
+            "still matches apps with an open-ended range.",
+        ),
+      }),
       execute: async (
-        _args: Record<never, never>,
+        args: { targetVersion?: string },
         context: Context & Deps,
       ) => {
         const { globalArgs: g, logger } = context;
@@ -1528,6 +2052,71 @@ export const model = {
             ", ",
           ) || "none",
         });
+
+        let targetVersion: string | null = null;
+        let compatibility: z.infer<typeof AppCompatibilitySchema>[] | null =
+          null;
+        let incompatible: string[] | null = null;
+        if (args.targetVersion !== undefined) {
+          const target = parseVersion(args.targetVersion);
+          if (!target) {
+            throw new Error(
+              `targetVersion ${
+                JSON.stringify(args.targetVersion)
+              } is not a stable Nextcloud version`,
+            );
+          }
+          targetVersion = formatVersion(target);
+          // Shipped apps upgrade with the server; only store apps can block.
+          const store = parseAppList(
+            await occ(
+              run,
+              ["app:list", "--shipped=false", "--output=json"],
+              g.occTimeoutMs,
+              context.signal,
+            ),
+            true,
+          ).enabled;
+          const url = `${
+            g.appStoreUrl.replace(/\/+$/, "")
+          }/api/v1/platform/${targetVersion}/apps.json`;
+          // The listing is several MB; allow it more than a status probe.
+          const res = await fetch(url, {
+            signal: callSignal(g.timeoutMs * 6, context.signal),
+          });
+          if (!res.ok) {
+            throw new Error(
+              `app store answered HTTP ${res.status} for ${targetVersion}: ` +
+                `${await readErrorBody(res)}`,
+            );
+          }
+          compatibility = computeCompatibility(
+            store,
+            parseStoreApps(await res.json()),
+          );
+          incompatible = compatibility.filter((c) => !c.compatible).map((c) =>
+            c.app
+          );
+          for (const c of compatibility.filter((c) => !c.compatible)) {
+            logger.warn(
+              "{app} {installed} has no release for Nextcloud {target}; the upgrade would disable it",
+              {
+                app: c.app,
+                installed: c.installedVersion,
+                target: targetVersion,
+              },
+            );
+          }
+          logger.info(
+            "{n} store apps checked against Nextcloud {target}: {bad} incompatible",
+            {
+              n: compatibility.length,
+              target: targetVersion,
+              bad: incompatible.length,
+            },
+          );
+        }
+
         const handle = await context.writeResource("apps", "apps-current", {
           enabled,
           disabled,
@@ -1535,6 +2124,9 @@ export const model = {
           disabledCount: Object.keys(disabled).length,
           updates,
           hasUpdates: updates.length > 0,
+          targetVersion,
+          compatibility,
+          incompatible,
           checkedAt: new Date().toISOString(),
         });
         return { dataHandles: [handle] };
@@ -1799,6 +2391,360 @@ export const model = {
             }`,
           );
         }
+        return { dataHandles: [handle] };
+      },
+    },
+
+    backup: {
+      description:
+        "Dump the MySQL/MariaDB database and archive web-root directories (config and custom_apps by default) into a new directory on the machine swamp runs on, then read both back to verify them. Dry run unless apply=true. The rollback point for an upgrade.",
+      arguments: z.object({
+        destDir: z.string().regex(/^\//).describe(
+          "Existing absolute directory, on the machine swamp runs on, to " +
+            "create the backup directory in. It is not created: a typo " +
+            "should fail, not scatter a tree.",
+        ),
+        label: z.string().regex(NAME_PATTERN).default("nextcloud").describe(
+          "Prefix of the backup directory, which is <label>-<UTC timestamp>.",
+        ),
+        dbContainer: z.string().regex(NAME_PATTERN).describe(
+          "Name of the MySQL/MariaDB container.",
+        ),
+        dbName: z.string().regex(NAME_PATTERN).default("nextcloud"),
+        dbUser: z.string().regex(NAME_PATTERN).default("root").describe(
+          "Database user to dump as. root sees routines and events; the " +
+            "application user may not.",
+        ),
+        dbPasswordEnv: z.string().regex(ENV_NAME_PATTERN).default(
+          "MARIADB_ROOT_PASSWORD",
+        ).describe(
+          "Environment variable, inside the database container, that holds " +
+            "dbUser's password. The mariadb image sets MARIADB_ROOT_PASSWORD, " +
+            "the mysql image MYSQL_ROOT_PASSWORD. The value never leaves the " +
+            "container and never appears in a command line.",
+        ),
+        webRoot: z.string().regex(/^\/[A-Za-z0-9_./-]*$/).default(
+          "/var/www/html",
+        ).describe("The web root inside the application container."),
+        paths: z.array(z.string().regex(WEBROOT_PATH_PATTERN)).min(1).default([
+          "config",
+          "custom_apps",
+          "themes",
+        ]).describe(
+          "Directories directly under webRoot to archive. The defaults are " +
+            "what an upgrade changes: config.php and the store apps it " +
+            "updates. User files in `data` are not touched by an upgrade and " +
+            "can be large; add `data` to include them.",
+        ),
+        apply: z.boolean().default(false).describe(
+          "Write the backup. Without it, measure what would be backed up " +
+            "and write nothing.",
+        ),
+      }),
+      execute: async (
+        args: {
+          destDir: string;
+          label: string;
+          dbContainer: string;
+          dbName: string;
+          dbUser: string;
+          dbPasswordEnv: string;
+          webRoot: string;
+          paths: string[];
+          apply: boolean;
+        },
+        context: Context & Deps,
+      ) => {
+        const { globalArgs: g, logger } = context;
+        const run = runnerFor(context);
+        const exec = execFor(context);
+        const db: DbTarget = {
+          user: args.dbUser,
+          name: args.dbName,
+          passwordEnv: args.dbPasswordEnv,
+        };
+        const longTimeout = g.occTimeoutMs * 10;
+        // du over a large `data` path can outlast a read-only occ timeout.
+        const execOk = async (spec: ExecSpec, what: string) => {
+          const r = await exec(spec, longTimeout, context.signal);
+          if (r.code !== 0) {
+            throw new Error(
+              `${what} exited ${r.code}: ${
+                (r.stderr.trim() || r.stdout.trim()).slice(-400)
+              }`,
+            );
+          }
+          return r.stdout;
+        };
+
+        const status = parseStatusDocument(
+          JSON.parse(
+            await occ(
+              run,
+              ["status", "--output=json"],
+              g.occTimeoutMs,
+              context.signal,
+            ),
+          ),
+        );
+        if (!status?.installed) {
+          throw new Error("occ status does not report an installed Nextcloud");
+        }
+
+        const liveTablesRaw = (await execOk(
+          {
+            container: args.dbContainer,
+            user: null,
+            command: ["sh", "-c", tableCountScript(db)],
+          },
+          "counting tables",
+        )).trim();
+        const liveTables = /^\d+$/.test(liveTablesRaw)
+          ? parseInt(liveTablesRaw, 10)
+          : NaN;
+        if (!(liveTables > 0)) {
+          throw new Error(
+            `database ${args.dbName} reports ${
+              JSON.stringify(liveTablesRaw.slice(0, 100))
+            } tables; refusing to back up what looks like the wrong database`,
+          );
+        }
+
+        const sourceKiB = parseDu(
+          await execOk(
+            {
+              container: g.container,
+              user: g.occUser,
+              command: [
+                "sh",
+                "-c",
+                `cd ${shellQuote(args.webRoot)} && du -sk -- ${
+                  args.paths.map(shellQuote).join(" ")
+                }`,
+              ],
+            },
+            "measuring paths",
+          ),
+        );
+        const missing = args.paths.filter((p) => !(p in sourceKiB));
+        if (missing.length > 0) {
+          throw new Error(
+            `not found under ${args.webRoot}: ${missing.join(", ")}`,
+          );
+        }
+
+        const summary = {
+          nextcloudVersion: status.versionstring,
+          database: {
+            container: args.dbContainer,
+            name: args.dbName,
+            liveTables,
+          },
+          sourceKiB,
+        };
+
+        if (!args.apply) {
+          logger.info(
+            "Dry run. Would back up Nextcloud {version}: database {db} ({tables} tables) and {paths} ({kib} KiB) into {dest}. Pass apply=true to write it.",
+            {
+              version: status.versionstring,
+              db: args.dbName,
+              tables: liveTables,
+              paths: args.paths.join(", "),
+              kib: Object.values(sourceKiB).reduce((a, b) => a + b, 0),
+              dest: args.destDir,
+            },
+          );
+          const handle = await context.writeResource(
+            "backup",
+            "backup-current",
+            {
+              applied: false,
+              verified: false,
+              directory: null,
+              nextcloudVersion: summary.nextcloudVersion,
+              database: {
+                ...summary.database,
+                dumpedTables: null,
+                dumpComplete: null,
+              },
+              archive: {
+                paths: args.paths,
+                sourceKiB,
+                entries: null,
+                hasConfigPhp: null,
+              },
+              files: [],
+              problems: [],
+              checkedAt: new Date().toISOString(),
+            },
+          );
+          return { dataHandles: [handle] };
+        }
+
+        const dest = await Deno.stat(args.destDir).catch(() => null);
+        if (!dest?.isDirectory) {
+          throw new Error(
+            `destDir ${args.destDir} is not an existing directory`,
+          );
+        }
+        const dir = `${args.destDir.replace(/\/+$/, "")}/${args.label}-${
+          backupStamp(new Date())
+        }`;
+        await Deno.mkdir(dir, { mode: 0o700 });
+        await Deno.chmod(dir, 0o700);
+        logger.info("Backing up Nextcloud {version} into {dir}", {
+          version: status.versionstring,
+          dir,
+        });
+
+        const problems: string[] = [];
+        const dumpName = `${args.dbName}.sql`;
+        const archiveName = "files.tar.gz";
+
+        // A failure here is recorded, not thrown, so the directory is still
+        // renamed .FAILED below and cannot be mistaken for a good backup.
+        const capture = async (spec: ExecSpec, what: string) => {
+          try {
+            const r = await exec(spec, longTimeout, context.signal);
+            if (r.code !== 0) {
+              problems.push(
+                `${what} exited ${r.code}: ${r.stderr.trim().slice(-300)}`,
+              );
+            }
+          } catch (err) {
+            problems.push(
+              `${what} failed: ${
+                err instanceof Error ? err.message : String(err)
+              }`,
+            );
+          }
+        };
+        await capture({
+          container: args.dbContainer,
+          user: null,
+          command: ["sh", "-c", dumpScript(db)],
+          stdoutFile: `${dir}/${dumpName}`,
+        }, "database dump");
+        await capture({
+          container: g.container,
+          user: g.occUser,
+          command: [
+            "tar",
+            "-czf",
+            "-",
+            "-C",
+            args.webRoot,
+            "--",
+            ...args.paths,
+          ],
+          stdoutFile: `${dir}/${archiveName}`,
+        }, "tar");
+
+        const openRead = async (name: string) =>
+          (await Deno.open(`${dir}/${name}`, { read: true })).readable;
+
+        let dumpedTables: number | null = null;
+        let dumpComplete: boolean | null = null;
+        try {
+          const d = await inspectDump(await openRead(dumpName));
+          dumpedTables = d.createTables;
+          dumpComplete = d.complete;
+          if (!d.complete) {
+            problems.push(
+              "the dump does not end with `-- Dump completed`; it was cut short",
+            );
+          }
+          if (d.createTables !== liveTables) {
+            problems.push(
+              `the dump creates ${d.createTables} tables; the database has ${liveTables}`,
+            );
+          }
+        } catch (err) {
+          problems.push(
+            `could not read the dump back: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+
+        let entries: number | null = null;
+        let hasConfigPhp: boolean | null = null;
+        try {
+          const names = await listTarGz(await openRead(archiveName));
+          entries = names.length;
+          if (entries === 0) problems.push("the archive has no entries");
+          if (args.paths.includes("config")) {
+            hasConfigPhp = names.includes("config/config.php");
+            if (!hasConfigPhp) {
+              problems.push("the archive has no config/config.php");
+            }
+          }
+        } catch (err) {
+          problems.push(
+            `could not read the archive back: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+        }
+
+        const files: z.infer<typeof BackupFileSchema>[] = [];
+        for (const name of [dumpName, archiveName]) {
+          const stat = await Deno.stat(`${dir}/${name}`).catch(() => null);
+          if (!stat) {
+            problems.push(`${name} was not written`);
+            continue;
+          }
+          files.push({
+            name,
+            bytes: stat.size,
+            sha256: await sha256Hex(await openRead(name)),
+          });
+        }
+        await Deno.writeTextFile(
+          `${dir}/SHA256SUMS`,
+          files.map((f) => `${f.sha256}  ${f.name}\n`).join(""),
+          { mode: 0o600, createNew: true },
+        );
+
+        const verified = problems.length === 0;
+        const finalDir = verified ? dir : `${dir}.FAILED`;
+        const record = {
+          applied: true,
+          verified,
+          directory: finalDir,
+          nextcloudVersion: summary.nextcloudVersion,
+          database: { ...summary.database, dumpedTables, dumpComplete },
+          archive: { paths: args.paths, sourceKiB, entries, hasConfigPhp },
+          files,
+          problems,
+          checkedAt: new Date().toISOString(),
+        };
+        // The directory describes itself: a restore should not depend on
+        // swamp's datastore being reachable.
+        await Deno.writeTextFile(
+          `${dir}/BACKUP.json`,
+          JSON.stringify(record, null, 2) + "\n",
+          { mode: 0o600, createNew: true },
+        );
+        if (!verified) await Deno.rename(dir, finalDir);
+
+        const handle = await context.writeResource(
+          "backup",
+          "backup-current",
+          record,
+        );
+        if (!verified) {
+          throw new Error(
+            `backup failed verification and was renamed ${finalDir}: ${
+              problems.join("; ")
+            }`,
+          );
+        }
+        logger.info(
+          "Backup verified: {tables} tables, {entries} archive entries, {dir}",
+          { tables: dumpedTables, entries, dir },
+        );
         return { dataHandles: [handle] };
       },
     },

@@ -1,8 +1,8 @@
 manifestVersion: 1
 
 name: "@sntxrr/nextcloud"
-version: "2026.09.24.1"
-description: "Health, version drift, setup checks, app updates and occ maintenance for a self-hosted Nextcloud. `sync` reads status.php and, with a serverinfo token, storage and user statistics; `drift` compares the running version against stable GitHub releases and reports the patch target and the next major separately, because Nextcloud refuses to skip a major and the newest release is often not a legal target; `setupchecks` records the admin overview's warnings as data; `apps` lists app store updates. `maintenance`, `dbRepair` and `updateApps` change state and are dry runs unless apply=true; each apply path re-reads the state afterwards and fails if the change did not take. occ runs through `docker exec`, locally or on a host over SSH with BatchMode. Four behaviours shape the implementation. Nextcloud 34 enforces trusted_domains on status.php and answers HTTP 400/code 15 when probed by IP, and Deno's fetch silently drops a Host header override, so baseUrl must be a trusted name and the error is named rather than reported as a bare 400. `occ setupchecks` exits 1 whenever any check warns, so exit 1 with a JSON report is data, not failure. Prerelease tags are spelled inconsistently (`rc2` and `RC2` both exist), so any suffixed tag is excluded, not parsed. And updates.nextcloud.com answers an empty 200 both for `nothing to offer` and for a query it did not understand, so it is not used. A failure to measure is raised, never reported as healthy, current or `no updates`."
+version: "2026.09.25.1"
+description: "Health, version drift, setup checks, app updates and compatibility, verified backups and occ maintenance for a self-hosted Nextcloud. `sync` reads status.php and, with a serverinfo token, storage and user statistics; `drift` compares the running version against stable GitHub releases and reports the patch target and the next major separately, because Nextcloud refuses to skip a major and the newest release is often not a legal target; `setupchecks` records the admin overview's warnings as data; `apps` lists app store updates and, given a targetVersion, which enabled store apps have no release for it. `backup` dumps MySQL/MariaDB and archives the web-root directories an upgrade changes onto the machine swamp runs on, then reads both back (dump completion line and table count, tar header checksums and gzip CRC) and renames a backup that fails `.FAILED`; the database password stays in the container's environment and never reaches a command line. `maintenance`, `dbRepair`, `updateApps` and `backup` change state and are dry runs unless apply=true; each apply path re-reads the state afterwards and fails if the change did not take. occ runs through `docker exec`, locally or on a host over SSH with BatchMode. Four behaviours shape the implementation. Nextcloud 34 enforces trusted_domains on status.php and answers HTTP 400/code 15 when probed by IP, and Deno's fetch silently drops a Host header override, so baseUrl must be a trusted name and the error is named rather than reported as a bare 400. `occ setupchecks` exits 1 whenever any check warns, so exit 1 with a JSON report is data, not failure. Prerelease tags are spelled inconsistently (`rc2` and `RC2` both exist), so any suffixed tag is excluded, not parsed. And updates.nextcloud.com answers an empty 200 both for `nothing to offer` and for a query it did not understand, so it is not used. A failure to measure is raised, never reported as healthy, current or `no updates`."
 repository: "https://github.com/sntxrr/swamp-nextcloud"
 
 models:
@@ -18,6 +18,8 @@ labels:
   - drift
   - version
   - maintenance
+  - backup
+  - upgrade
   - occ
   - homelab
   - self-hosted
