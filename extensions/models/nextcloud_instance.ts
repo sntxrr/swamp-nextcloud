@@ -2,7 +2,7 @@
  * Nextcloud instance — health, version drift, app updates and `occ`
  * maintenance for a self-hosted {@link https://nextcloud.com | Nextcloud}.
  *
- * Eight methods over two transports.
+ * Nine methods over two transports.
  *
  * Over HTTP, needing no credential beyond an optional read-only token:
  *
@@ -15,6 +15,9 @@
  * Over `occ` and `docker exec`, run either locally or on a host over SSH:
  *
  * - `setupchecks` — the admin overview's warnings, as data. Read-only.
+ * - `talkBots` — Talk bots that are not enabled, whose webhook delivery
+ *   errors rose since the last reading, or that are expected and missing.
+ *   Read-only.
  * - `apps` — installed apps and the ones with updates available, and with a
  *   `targetVersion`, which store apps have no release for that version.
  *   Read-only.
@@ -327,6 +330,42 @@ const SetupChecksSchema = z.object({
   checkedAt: z.iso.datetime(),
 });
 
+const TalkBotSchema = z.object({
+  id: z.number().int(),
+  name: z.string(),
+  state: z.number().int().describe(
+    "Talk's bot state: 0 disabled, 1 enabled, 2 no-setup, 3 app disabled.",
+  ),
+  stateName: z.string(),
+  errorCount: z.number().int().describe(
+    "Talk's lifetime count of failed webhook deliveries. Talk never resets " +
+      "it, so only a rise means something new went wrong.",
+  ),
+  newErrors: z.number().int().nullable().describe(
+    "Rise in errorCount since the previous reading; null on the first " +
+      "reading of this bot, which only sets the baseline.",
+  ),
+  features: z.string().nullable(),
+});
+
+const TalkBotsSchema = z.object({
+  total: z.number().int(),
+  bots: z.array(TalkBotSchema).describe("Every installed bot, as reported."),
+  expected: z.array(z.string()).describe(
+    "Bot names that must be installed and enabled.",
+  ),
+  missing: z.array(z.string()).describe("Expected names not installed."),
+  problems: z.array(z.string()).describe(
+    "One line per finding: a watched bot not enabled, a watched bot with " +
+      "new delivery errors, or an expected bot missing.",
+  ),
+  attention: z.boolean().describe("True when problems is not empty."),
+  previousCheckedAt: z.string().nullable().describe(
+    "checkedAt of the reading newErrors is measured against.",
+  ),
+  checkedAt: z.iso.datetime(),
+});
+
 const AppUpdateSchema = z.object({
   app: z.string(),
   currentVersion: z.string().nullable(),
@@ -494,6 +533,8 @@ type Context = {
     name: string,
     data: Record<string, unknown>,
   ) => Promise<{ name: string }>;
+  /** The latest stored version of one of this model's resources. */
+  readResource?: (name: string) => Promise<Record<string, unknown> | null>;
 };
 
 /* ------------------------------------------------------------------ *
@@ -1007,6 +1048,115 @@ export function parseSetupChecks(stdout: string) {
     );
   }
   return checks;
+}
+
+/** Talk's `Bot::STATE_*` constants. */
+export const TALK_BOT_STATES: Record<number, string> = {
+  0: "disabled",
+  1: "enabled",
+  2: "no-setup",
+  3: "app-disabled",
+};
+
+/** A bot as `talkBots` records it, before the comparison with a prior run. */
+export type TalkBotReading = {
+  id: number;
+  name: string;
+  state: number;
+  stateName: string;
+  errorCount: number;
+  features: string | null;
+};
+
+/**
+ * Parse `occ talk:bot:list --output=json`.
+ *
+ * Copies the named fields only. The non-verbose listing does not include a
+ * bot's secret or URL, but copying by name keeps that true even if a Talk
+ * release starts to. For the same reason, an error here never quotes the
+ * output: with `-v` the listing carries the bot's HMAC secret.
+ */
+export function parseTalkBots(stdout: string): TalkBotReading[] {
+  let doc: unknown;
+  try {
+    doc = JSON.parse(stdout);
+  } catch {
+    throw new Error(
+      `occ talk:bot:list did not return JSON (${stdout.length} bytes)`,
+    );
+  }
+  if (!Array.isArray(doc)) {
+    throw new Error("occ talk:bot:list returned JSON of an unexpected shape");
+  }
+  return doc.map((raw, i) => {
+    const b = (raw ?? {}) as Record<string, unknown>;
+    const id = num(b.id);
+    const state = num(b.state);
+    const errorCount = num(b.error_count);
+    const name = str(b.name);
+    if (id === null || state === null || errorCount === null || !name) {
+      throw new Error(
+        `occ talk:bot:list entry ${i} lacks id, name, state or error_count`,
+      );
+    }
+    return {
+      id,
+      name,
+      state,
+      stateName: TALK_BOT_STATES[state] ?? `unknown(${state})`,
+      errorCount,
+      features: str(b.features),
+    };
+  });
+}
+
+/**
+ * Compare a bot listing with the previous one and name what needs a person.
+ *
+ * `error_count` only ever rises (Talk increments it on every failed webhook
+ * delivery and nothing resets it), so the finding is a RISE since the last
+ * reading, not a nonzero count: a count of 3 from a restart last month would
+ * otherwise alert every day forever. Each rise is a message Talk dropped,
+ * because Talk does not retry a delivery.
+ *
+ * @param expected Bot names to watch. When empty every bot is watched; when
+ *   given, only those are, so a bot someone disabled on purpose does not page.
+ * @param prior The previous reading's bots, or null on the first run.
+ */
+export function assessTalkBots(
+  bots: TalkBotReading[],
+  expected: string[],
+  prior: { id: number; errorCount: number }[] | null,
+) {
+  const priorById = new Map((prior ?? []).map((b) => [b.id, b.errorCount]));
+  const watched = (name: string) =>
+    expected.length === 0 || expected.includes(name);
+  const problems: string[] = [];
+  const out = bots.map((b) => {
+    const before = priorById.get(b.id);
+    // A lower count means the bot was reinstalled under the same id; its new
+    // count is the whole of its history.
+    const newErrors = before === undefined
+      ? null
+      : b.errorCount >= before
+      ? b.errorCount - before
+      : b.errorCount;
+    if (watched(b.name)) {
+      if (b.state !== 1) {
+        problems.push(`bot "${b.name}" (id ${b.id}) is ${b.stateName}`);
+      }
+      if (newErrors !== null && newErrors > 0) {
+        problems.push(
+          `bot "${b.name}" (id ${b.id}) has ${newErrors} new delivery ` +
+            `error(s), ${b.errorCount} in total`,
+        );
+      }
+    }
+    return { ...b, newErrors };
+  });
+  const missing = expected.filter((n) => !bots.some((b) => b.name === n));
+  for (const n of missing) problems.push(`bot "${n}" is not installed`);
+  return { bots: out, missing, problems };
 }
 
 /**
@@ -1609,13 +1759,19 @@ export const model = {
   type: "@sntxrr/nextcloud/instance",
   description:
     "Health, version drift, setup checks, app updates and compatibility, verified backups and occ maintenance for a self-hosted Nextcloud. Methods that change state are dry runs unless apply=true.",
-  version: "2026.09.25.1",
+  version: "2026.09.30.1",
   globalArguments: GlobalArgsSchema,
   upgrades: [
     {
       toVersion: "2026.09.25.1",
       description:
         "Add appStoreUrl (defaults to https://apps.nextcloud.com); existing arguments are unchanged",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.09.30.1",
+      description:
+        "Add the talkBots method and resource; arguments are unchanged",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1637,6 +1793,13 @@ export const model = {
     setupchecks: {
       description: "The admin overview's setup checks, as data.",
       schema: SetupChecksSchema,
+      lifetime: "infinite" as const,
+      garbageCollection: 30,
+    },
+    talkBots: {
+      description:
+        "Nextcloud Talk bots: state, delivery errors and their rise since the last reading.",
+      schema: TalkBotsSchema,
       lifetime: "infinite" as const,
       garbageCollection: 30,
     },
@@ -2008,6 +2171,63 @@ export const model = {
             warnings: counts.warning ?? 0,
             problems,
             checks,
+            checkedAt: new Date().toISOString(),
+          },
+        );
+        return { dataHandles: [handle] };
+      },
+    },
+
+    talkBots: {
+      description:
+        "Read Nextcloud Talk's bots and flag a watched bot that is not enabled, one whose delivery errors rose since the last reading, or an expected bot that is missing. Talk drops a message whose webhook delivery fails and never resets the error count, so a rise is the signal. Read-only.",
+      arguments: z.object({
+        expectedBots: z.array(z.string()).default([]).describe(
+          "Bot names that must be installed and enabled. When given, only " +
+            "these are watched; when empty, every installed bot is.",
+        ),
+      }),
+      execute: async (
+        args: { expectedBots?: string[] },
+        context: Context & Deps,
+      ) => {
+        const { globalArgs: g, logger } = context;
+        const expected = args.expectedBots ?? [];
+        logger.info("Reading Talk bots in {container} on {host}", {
+          container: g.container,
+          host: g.sshHost ?? "local docker",
+        });
+        // Not -v: the verbose listing includes each bot's HMAC secret.
+        const out = await occ(
+          runnerFor(context),
+          ["talk:bot:list", "--output=json"],
+          g.occTimeoutMs,
+          context.signal,
+        );
+        const bots = parseTalkBots(out);
+        const previous = context.readResource
+          ? await context.readResource("talkbots-current")
+          : null;
+        const priorBots = Array.isArray(previous?.bots)
+          ? (previous.bots as { id: number; errorCount: number }[])
+          : null;
+        const result = assessTalkBots(bots, expected, priorBots);
+        for (const p of result.problems) {
+          logger.warn("talk bot: {problem}", { problem: p });
+        }
+        const handle = await context.writeResource(
+          "talkBots",
+          "talkbots-current",
+          {
+            total: bots.length,
+            bots: result.bots,
+            expected,
+            missing: result.missing,
+            problems: result.problems,
+            attention: result.problems.length > 0,
+            previousCheckedAt: typeof previous?.checkedAt === "string"
+              ? previous.checkedAt
+              : null,
             checkedAt: new Date().toISOString(),
           },
         );

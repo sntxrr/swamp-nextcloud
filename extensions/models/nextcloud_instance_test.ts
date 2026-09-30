@@ -5,6 +5,7 @@ import {
   assertThrows,
 } from "jsr:@std/assert@1";
 import {
+  assessTalkBots,
   backupStamp,
   checkOccReachable,
   computeCompatibility,
@@ -20,19 +21,20 @@ import {
   occArgv,
   type OccResult,
   parseAppList,
-  parseDu,
-  parseStoreApps,
-  sha256Hex,
-  tableCountScript,
   parseAppUpdates,
+  parseDu,
   parseMaintenanceMode,
   parseRepairDryRun,
   parseServerinfo,
   parseSetupChecks,
   parseStatusDocument,
+  parseStoreApps,
+  parseTalkBots,
   parseVersion,
   type ReleaseInfo,
+  sha256Hex,
   shellQuote,
+  tableCountScript,
 } from "./nextcloud_instance.ts";
 
 /* ------------------------------------------------------------------ *
@@ -866,7 +868,10 @@ Deno.test("apps with targetVersion checks only store apps against the store", as
   }, async () => {
     await run("apps", { targetVersion: "v35.0.1" }, h.context);
   });
-  assertEquals(asked, "https://apps.nextcloud.com/api/v1/platform/35.0.1/apps.json");
+  assertEquals(
+    asked,
+    "https://apps.nextcloud.com/api/v1/platform/35.0.1/apps.json",
+  );
   assertEquals(h.written.apps.targetVersion, "35.0.1");
   assertEquals(h.written.apps.incompatible, ["deck"]);
 });
@@ -1051,7 +1056,11 @@ Deno.test("backupStamp is sortable and file-name safe", () => {
  * backup: the password never reaches a command line
  * ------------------------------------------------------------------ */
 
-const DB = { user: "root", name: "nextcloud", passwordEnv: "MARIADB_ROOT_PASSWORD" };
+const DB = {
+  user: "root",
+  name: "nextcloud",
+  passwordEnv: "MARIADB_ROOT_PASSWORD",
+};
 
 Deno.test("database scripts name the password variable, never a value", () => {
   for (const s of [tableCountScript(DB), dumpScript(DB)]) {
@@ -1184,8 +1193,14 @@ Deno.test("backup apply writes, reads back and verifies", async () => {
   const dir = await onlyEntry(dest);
   assert(/\/nc-\d{8}T\d{6}Z$/.test(dir), dir);
   assertEquals((await Deno.stat(dir)).mode! & 0o777, 0o700);
-  for (const name of ["nextcloud.sql", "files.tar.gz", "SHA256SUMS", "BACKUP.json"]) {
-    assertEquals((await Deno.stat(`${dir}/${name}`)).mode! & 0o777, 0o600, name);
+  for (
+    const name of ["nextcloud.sql", "files.tar.gz", "SHA256SUMS", "BACKUP.json"]
+  ) {
+    assertEquals(
+      (await Deno.stat(`${dir}/${name}`)).mode! & 0o777,
+      0o600,
+      name,
+    );
   }
   const sums = await Deno.readTextFile(`${dir}/SHA256SUMS`);
   assert(sums.includes(`${await sha256Hex(bytesStream(DUMP))}  nextcloud.sql`));
@@ -1207,7 +1222,8 @@ Deno.test("backup apply renames a dump that was cut short .FAILED and throws", a
   const cut = DUMP.slice(0, DUMP.indexOf("-- Dump completed"));
   const { h, context } = await backupContext({ dump: cut, dumpCode: 2 });
   await assertRejects(
-    () => run("backup", { ...BACKUP_ARGS, destDir: dest, apply: true }, context),
+    () =>
+      run("backup", { ...BACKUP_ARGS, destDir: dest, apply: true }, context),
     Error,
     "failed verification",
   );
@@ -1224,7 +1240,8 @@ Deno.test("backup apply fails when the dump has fewer tables than the database",
   const dest = await Deno.makeTempDir();
   const { h, context } = await backupContext({ tables: "4" });
   await assertRejects(
-    () => run("backup", { ...BACKUP_ARGS, destDir: dest, apply: true }, context),
+    () =>
+      run("backup", { ...BACKUP_ARGS, destDir: dest, apply: true }, context),
     Error,
     "creates 3 tables; the database has 4",
   );
@@ -1236,7 +1253,8 @@ Deno.test("backup refuses a database with no tables before writing anything", as
   const dest = await Deno.makeTempDir();
   const { f, context } = await backupContext({ tables: "0" });
   await assertRejects(
-    () => run("backup", { ...BACKUP_ARGS, destDir: dest, apply: true }, context),
+    () =>
+      run("backup", { ...BACKUP_ARGS, destDir: dest, apply: true }, context),
     Error,
     "wrong database",
   );
@@ -1256,4 +1274,140 @@ Deno.test("backup apply refuses a destDir that does not exist", async () => {
     Error,
     "not an existing directory",
   );
+});
+
+/* ------------------------------------------------------------------ *
+ * talkBots
+ * ------------------------------------------------------------------ */
+
+const BOTS = (errorCount: number, state = 1) =>
+  JSON.stringify([{
+    id: 7,
+    name: "Example Bridge",
+    description: "d",
+    error_count: errorCount,
+    state,
+    features: "webhook, response",
+  }]);
+const BOTLIST = "talk:bot:list --output=json";
+
+/** harness() plus a stored previous talkbots-current reading. */
+function talkHarness(stdout: string, previous: Record<string, unknown> | null) {
+  const h = harness({ [BOTLIST]: ok(stdout) });
+  const reads: string[] = [];
+  const context = {
+    ...h.context,
+    readResource: (name: string) => {
+      reads.push(name);
+      return Promise.resolve(previous);
+    },
+  };
+  return { ...h, context, reads };
+}
+
+Deno.test("parseTalkBots copies named fields only", () => {
+  const bots = parseTalkBots(JSON.stringify([{
+    id: 2,
+    name: "B",
+    error_count: 0,
+    state: 1,
+    features: "webhook",
+    secret: "must-not-survive",
+    url: "https://x",
+  }]));
+  assertEquals(bots, [{
+    id: 2,
+    name: "B",
+    state: 1,
+    stateName: "enabled",
+    errorCount: 0,
+    features: "webhook",
+  }]);
+});
+
+Deno.test("parseTalkBots never quotes its input in an error", () => {
+  const err = assertThrows(() => parseTalkBots("secret-ish-not-json"));
+  assert(!(err as Error).message.includes("secret-ish"));
+  assertThrows(() => parseTalkBots('{"id":1}'), Error, "unexpected shape");
+  assertThrows(() => parseTalkBots('[{"id":1}]'), Error, "lacks id, name");
+});
+
+Deno.test("parseTalkBots names Talk's states, and an unknown one", () => {
+  const bots = parseTalkBots(
+    '[{"id":1,"name":"a","error_count":0,"state":3},' +
+      '{"id":2,"name":"b","error_count":0,"state":9}]',
+  );
+  assertEquals(bots.map((b) => b.stateName), ["app-disabled", "unknown(9)"]);
+});
+
+Deno.test("assessTalkBots: the first reading sets a baseline, not an alert", () => {
+  const r = assessTalkBots(parseTalkBots(BOTS(5)), [], null);
+  assertEquals(r.bots[0].newErrors, null);
+  assertEquals(r.problems, []);
+});
+
+Deno.test("assessTalkBots: an old nonzero count that did not rise is quiet", () => {
+  const r = assessTalkBots(parseTalkBots(BOTS(5)), [], [{
+    id: 7,
+    errorCount: 5,
+  }]);
+  assertEquals(r.bots[0].newErrors, 0);
+  assertEquals(r.problems, []);
+});
+
+Deno.test("assessTalkBots: a rise is a problem naming the bot and the delta", () => {
+  const r = assessTalkBots(parseTalkBots(BOTS(8)), [], [{
+    id: 7,
+    errorCount: 5,
+  }]);
+  assertEquals(r.bots[0].newErrors, 3);
+  assertEquals(r.problems, [
+    'bot "Example Bridge" (id 7) has 3 new delivery error(s), 8 in total',
+  ]);
+});
+
+Deno.test("assessTalkBots: a disabled bot is a problem", () => {
+  const r = assessTalkBots(parseTalkBots(BOTS(0, 0)), [], null);
+  assertEquals(r.problems, ['bot "Example Bridge" (id 7) is disabled']);
+});
+
+Deno.test("assessTalkBots: a missing expected bot is a problem", () => {
+  const r = assessTalkBots(parseTalkBots(BOTS(0)), ["No Such Bot"], null);
+  assertEquals(r.missing, ["No Such Bot"]);
+  assertEquals(r.problems, ['bot "No Such Bot" is not installed']);
+});
+
+Deno.test("assessTalkBots: with expected names, other bots are not watched", () => {
+  const r = assessTalkBots(parseTalkBots(BOTS(9, 0)), ["Other"], [
+    { id: 7, errorCount: 1 },
+  ]);
+  assertEquals(r.problems, ['bot "Other" is not installed']);
+});
+
+Deno.test("talkBots compares with the stored reading and records it", async () => {
+  const h = talkHarness(BOTS(6), {
+    bots: [{ id: 7, errorCount: 4 }],
+    checkedAt: "2026-09-29T07:14:00.000Z",
+  });
+  await run("talkBots", { expectedBots: ["Example Bridge"] }, h.context);
+  assertEquals(h.calls, [BOTLIST]);
+  assertEquals(h.reads, ["talkbots-current"]);
+  const w = h.written.talkBots;
+  assertEquals(w.attention, true);
+  assertEquals(w.previousCheckedAt, "2026-09-29T07:14:00.000Z");
+  assertEquals((w.bots as { newErrors: number }[])[0].newErrors, 2);
+});
+
+Deno.test("talkBots on a first run is clean and has no previous reading", async () => {
+  const h = talkHarness(BOTS(0), null);
+  await run("talkBots", { expectedBots: ["Example Bridge"] }, h.context);
+  assertEquals(h.written.talkBots.attention, false);
+  assertEquals(h.written.talkBots.previousCheckedAt, null);
+});
+
+Deno.test("talkBots raises when occ fails (Talk not installed, say)", async () => {
+  const h = harness({
+    [BOTLIST]: ok("Command talk:bot:list is not defined", 1),
+  });
+  await assertRejects(() => run("talkBots", {}, h.context), Error, "exited 1");
 });
