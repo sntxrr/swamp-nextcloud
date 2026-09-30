@@ -1411,3 +1411,13 @@ Deno.test("talkBots raises when occ fails (Talk not installed, say)", async () =
   });
   await assertRejects(() => run("talkBots", {}, h.context), Error, "exited 1");
 });
+
+Deno.test("talkBots refuses to run blind when readResource is missing", async () => {
+  const h = harness({ [BOTLIST]: ok(BOTS(0)) });
+  await assertRejects(
+    () => run("talkBots", {}, h.context),
+    Error,
+    "needs context.readResource",
+  );
+  assertEquals(h.written.talkBots, undefined);
+});

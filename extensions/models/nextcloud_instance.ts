@@ -2205,9 +2205,15 @@ export const model = {
           context.signal,
         );
         const bots = parseTalkBots(out);
-        const previous = context.readResource
-          ? await context.readResource("talkbots-current")
-          : null;
+        // Without the previous reading every run looks like the first, and a
+        // rise can never be seen: a watch that is silently blind. Refuse.
+        if (!context.readResource) {
+          throw new Error(
+            "talkBots needs context.readResource to compare with its " +
+              "previous reading, and this swamp does not provide it",
+          );
+        }
+        const previous = await context.readResource("talkbots-current");
         const priorBots = Array.isArray(previous?.bots)
           ? (previous.bots as { id: number; errorCount: number }[])
           : null;
